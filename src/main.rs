@@ -17,31 +17,7 @@ pub const VERSION: &str = "v0.1.0";
 #[derive(Parser)]
 #[command(name = "nxpkg")]
 #[command(about = "NeoniX PacKaGe Manager for Neonix v1.x \n
-Version 1.0 \n
-This is designed especially for Neonix family Linux distro. Compact and community oriented. \n
-
-MIT License \n \n
-
-Copyright (c) 2025 Efe Ilhan Yuce \n \n
-
-Permission is hereby granted, free of charge, to any person obtaining a copy \n
-of this software and associated documentation files (the Software), to deal \n
-in the Software without restriction, including without limitation the rights \n
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell \n
-copies of the Software, and to permit persons to whom the Software is \n
-furnished to do so, subject to the following conditions: \n \n
-
-The above copyright notice and this permission notice shall be included in all \n
-copies or substantial portions of the Software. \n \n
-
-THE SOFTWARE IS PROVIDED AS IS, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR \n
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, \n
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE \n
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER \n
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, \n
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE \n
-SOFTWARE.
-")]
+Version 1.0 \n This is designed especially for Neonix family Linux distro. Compact and community oriented. \n")]
 
 struct Cli {
     #[command(subcommand)]
@@ -420,7 +396,6 @@ async fn main() {
         Commands::About => {
             println!("{}", "NeoniX PacKaGe Manager for Neonix v1.x".blue());
             println!("{}", "This is designed especially for Neonix family Linux distro. Compact and community oriented.".yellow());
-            println!("{}", "\n{}\n\nCopyright (c) 2025 Efe Ilhan Yuce\n\nPermission is hereby granted, free of charge, to any person obtaining a copyof this software and associated documentation files (the Software), to dealin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software isfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in allcopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED AS IS, WITHOUT WARRANTY OF ANY KIND, EXPRESS ORIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THEAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHERLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THESOFTWARE.".red());
         }
         Commands::Version => {
             println!("Neonix {} ({})", VERSION, std::env::consts::ARCH);
