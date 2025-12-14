@@ -65,8 +65,30 @@ enum Commands {
         name: String,
     },
 
+    /// Manage and select source repositories (from repos.cfg)
+    Repos {
+        #[command(subcommand)]
+        action: RepoAction,
+    },
+
+    /// Manage binary repository remotes (for package index/download)
+    RepoRemote {
+        #[command(subcommand)]
+        action: RepoRemoteAction,
+    },
+
     // Show version of the nxpkg
     Version,
+
+    /// Health check (periodic diagnostics)
+    Health {
+        /// Skip network (don't fetch repository index)
+        #[arg(long = "no-network")]
+        no_network: bool,
+        /// Check chroot prerequisites (check required tools in PATH)
+        #[arg(long = "check-chroot")]
+        check_chroot: bool,
+    },
 
     /// Publish a built .nxpkg to the repository and update index.json (optionally sign)
     Publish {
@@ -88,6 +110,34 @@ enum Commands {
         #[arg(long = "sign-keypair-file")]
         sign_keypair_file: Option<String>,
     },
+}
+
+// Subcommands for repo management
+#[derive(Subcommand)]
+enum RepoAction {
+    /// List configured repositories from repos.cfg
+    List,
+    /// Add or update an entry in user repos.cfg (~/.config/nxpkg/repos.cfg)
+    Add { name: String, url: String },
+    /// Remove an entry from user repos.cfg
+    Remove { name: String },
+    /// Choose a repo from configured repos (optionally filter by term)
+    Choose { term: Option<String>, #[arg(long = "build")] build: bool, #[arg(long = "print-url")] print_url: bool },
+}
+
+// Binary repo remote management
+#[derive(Subcommand)]
+enum RepoRemoteAction {
+    /// List configured binary repo remotes and show active
+    List,
+    /// Add or update a binary repo remote in user file
+    Add { name: String, url: String },
+    /// Remove a binary repo remote from user file
+    Remove { name: String },
+    /// Choose active binary repo remote by name
+    Choose { name: String },
+    /// Show current effective repo URL
+    Current,
 }
 
 // Helper enum and function for build system detection
@@ -181,13 +231,22 @@ async fn main() {
                         return;
                     }
                 };
+
+                // Resolve proper asset for current architecture
+                let (asset_url, asset_sha) = match download::resolve_asset_for_current_arch(package_entry) {
+                    Some(x) => x,
+                    None => {
+                        pb.finish_with_message(format!("No compatible asset for '{}' on arch {}.", remote_name, std::env::consts::ARCH).red().to_string());
+                        return;
+                    }
+                };
                 
                 package_name_from_source = remote_name;
                 nxpkg_path = cfg.cache_dir.join(format!("{}.nxpkg", package_name_from_source));
 
                 pb.finish_and_clear();
                 
-                if let Err(e) = download::download_file_with_progress(&package_entry.download_url, &nxpkg_path, package_entry.sha256.as_deref()).await {
+                if let Err(e) = download::download_file_with_progress(&asset_url, &nxpkg_path, asset_sha.as_deref()).await {
                     eprintln!("{}", format!("\nDownload failed: {}", e).red());
                     return;
                 }
@@ -206,13 +265,19 @@ async fn main() {
             }
 
             pb.set_message(format!("Extracting package '{}'...", package_name_from_source));
-            let (recipe, _installed_files) = match compress::extract_nxpkg(&nxpkg_path) {
+            let (mut recipe, installed_files) = match compress::extract_nxpkg(&nxpkg_path) {
                 Ok(r) => r,
                 Err(e) => {
                     pb.finish_with_message(format!("Failed to install package: {}", e).red().to_string());
                     return;
                 }
             };
+
+            // Persist installed file paths into the recipe so uninstall can remove them later
+            recipe.install.installed_files = installed_files
+                .into_iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
             
             pb.set_message("Registering package in database...");
             if let Err(e) = db1.save_package_metadata(&recipe) {
@@ -376,7 +441,7 @@ async fn main() {
                 Some(BuildSystem::Meson(path)) => {
                     // Meson needs to be handled differently inside chroot
                     pb_build.set_message("Building with 'meson/ninja' in chroot...");
-                     let status = chroot_env.run_command("/bin/bash", &[
+                     let status = chroot_env.run_command("bash", &[
                         "-c", 
                         &format!("cd {} && meson setup build && ninja -C build", build_path_in_chroot.display())
                     ]);
@@ -384,7 +449,7 @@ async fn main() {
                 }
                  Some(BuildSystem::CMake(path)) => {
                     pb_build.set_message("Building with 'cmake/make' in chroot...");
-                    let status = chroot_env.run_command("/bin/bash", &[
+                    let status = chroot_env.run_command("bash", &[
                         "-c", 
                         &format!("cd {} && cmake . && make", build_path_in_chroot.display())
                     ]);
@@ -392,7 +457,7 @@ async fn main() {
                 }
                 Some(BuildSystem::SCons(path)) => {
                     pb_build.set_message("Building with 'scons' in chroot...");
-                    let status = chroot_env.run_command("/bin/bash", &[
+                    let status = chroot_env.run_command("bash", &[
                         "-c", 
                         &format!("cd {}", build_path_in_chroot.display())
                     ]);
@@ -400,7 +465,7 @@ async fn main() {
                 }
                 Some(BuildSystem::Make(path)) => {
                     pb_build.set_message("Building with 'make' in chroot...");
-                     let status = chroot_env.run_command("/bin/bash", &[
+                     let status = chroot_env.run_command("bash", &[
                         "-c", 
                         &format!("cd {} && make", build_path_in_chroot.display())
                     ]);
@@ -426,6 +491,89 @@ async fn main() {
 
         }
 
+        Commands::RepoRemote { action } => {
+            match action {
+                RepoRemoteAction::List => {
+                    let cfg_now = AppConfig::load();
+                    let active = cfg_now.active_repo.clone();
+                    if cfg_now.repo_remotes.is_empty() {
+                        println!("{}", "No binary repo remotes configured.".yellow());
+                    } else {
+                        println!("Configured binary repo remotes ({}):", cfg_now.repo_remotes.len());
+                        for (name, url) in cfg_now.repo_remotes.iter() {
+                            if Some(name.clone()) == active {
+                                println!("* {} -> {} {}", name.cyan(), url, "(active)".green());
+                            } else {
+                                println!("  {} -> {}", name.cyan(), url);
+                            }
+                        }
+                    }
+                }
+                RepoRemoteAction::Add { name, url } => {
+                    match AppConfig::add_repo_remote(&name, &url) {
+                        Ok(_) => println!("{} {} -> {}", "Added/updated binary remote:".green(), name, url),
+                        Err(e) => eprintln!("{} {}", "Failed to add remote:".red(), e),
+                    }
+                }
+                RepoRemoteAction::Remove { name } => {
+                    match AppConfig::remove_repo_remote(&name) {
+                        Ok(_) => println!("{} {}", "Removed binary remote:".green(), name),
+                        Err(e) => eprintln!("{} {}", "Failed to remove remote:".red(), e),
+                    }
+                }
+                RepoRemoteAction::Choose { name } => {
+                    match AppConfig::set_active_repo(&name) {
+                        Ok(_) => {
+                            let cfg_now = AppConfig::load();
+                            println!("Active binary remote set to '{}' -> {}", name.cyan(), cfg_now.repo_url);
+                        }
+                        Err(e) => eprintln!("{} {}", "Failed to set active remote:".red(), e),
+                    }
+                }
+                RepoRemoteAction::Current => {
+                    let cfg_now = AppConfig::load();
+                    println!("{}", cfg_now.repo_url);
+                }
+            }
+        }
+
+        Commands::Repos { action } => {
+            match action {
+                RepoAction::List => {
+                    let list = repo::configured_repos();
+                    if list.is_empty() { println!("{}", "No configured repositories.".yellow()); }
+                    else {
+                        println!("Configured repositories ({}):", list.len());
+                        for r in list { println!("- {} -> {}", r.name.cyan(), r.clone_url); }
+                    }
+                }
+                RepoAction::Add { name, url } => {
+                    match repo::add_repo_entry(&name, &url) {
+                        Ok(_) => println!("{} {} -> {}", "Added/updated:".green(), name, url),
+                        Err(e) => eprintln!("{} {}", "Failed to add repo:".red(), e),
+                    }
+                }
+                RepoAction::Remove { name } => {
+                    match repo::remove_repo_entry(&name) {
+                        Ok(_) => println!("{} {}", "Removed:".green(), name),
+                        Err(e) => eprintln!("{} {}", "Failed to remove repo:".red(), e),
+                    }
+                }
+                RepoAction::Choose { term, build, print_url } => {
+                    match repo::select_repo_from_config(term.as_deref()) {
+                        Ok(selected) => {
+                            println!("Selected: {} -> {}", selected.name.cyan(), selected.clone_url);
+                            if print_url { println!("{}", selected.clone_url); }
+                            if build {
+                                println!("{} {}", "Tip:".yellow(), format!("Run: nxpkg buildins '{}'", selected.name));
+                            }
+                        }
+                        Err(e) => eprintln!("{} {}", "Selection failed:".red(), e),
+                    }
+                }
+            }
+        }
+
         Commands::Debug1 { name} => {
             match compress::decompress_tarball(&name) {
                 Ok(_) => {
@@ -442,6 +590,68 @@ async fn main() {
         }
         Commands::Version => {
             println!("Neonix {} ({})", VERSION, std::env::consts::ARCH);
+        }
+        Commands::Health { no_network, check_chroot } => {
+            let pb = ProgressBar::new_spinner();
+            pb.enable_steady_tick(std::time::Duration::from_millis(120));
+            pb.set_style(ProgressStyle::with_template("{spinner:.green} {elapsed_precise} {msg}").unwrap());
+            pb.set_message("Running health checks...");
+
+            let mut ok = true;
+
+            // 1) Database check: ensure we can query the packages table
+            match db1.db.query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='packages'",
+                [],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(_name) => {}
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    ok = false;
+                    eprintln!("{} {}", "DB check failed:".red(), "packages table missing");
+                }
+                Err(e) => {
+                    ok = false;
+                    eprintln!("{} {}", "DB check failed:".red(), e);
+                }
+            }
+
+            // 2) Cache dir write test
+            let tmp_file = cfg.cache_dir.join(".nxpkg_healthcheck.tmp");
+            match std::fs::write(&tmp_file, b"ok") {
+                Ok(_) => { let _ = std::fs::remove_file(&tmp_file); }
+                Err(e) => { ok = false; eprintln!("{} {}", "Cache dir write failed:".red(), e); }
+            }
+
+            // 3) Network + repo index (unless skipped)
+            if !no_network {
+                match download::fetch_index_verified(&cfg.repo_url, Some(&cfg.pubkey_path), cfg.require_signed_index).await {
+                    Ok(_) => {}
+                    Err(e) => { ok = false; eprintln!("{} {}", "Repo index fetch failed:".red(), e); }
+                }
+            }
+
+            // 4) Optional chroot prerequisites: presence of needed tools
+            if check_chroot {
+                let tools = [
+                    "bash", "sh", "make", "gcc", "g++", "cargo", "meson",
+                    "ninja", "cmake", "git", "scons", "python", "ld"
+                ];
+                for t in tools.iter() {
+                    let status = std::process::Command::new("which").arg(t).status();
+                    if status.map_or(true, |s| !s.success()) {
+                        ok = false;
+                        eprintln!("{} '{}' not found in PATH", "Missing tool:".red(), t);
+                    }
+                }
+            }
+
+            if ok {
+                pb.finish_with_message("Health OK".green().to_string());
+            } else {
+                pb.finish_with_message("Health check failed".red().to_string());
+                std::process::exit(1);
+            }
         }
         Commands::Publish { file, desc, repo, token, sign_keypair_b64, sign_keypair_file } => {
             let nxpkg_path = PathBuf::from(&file);

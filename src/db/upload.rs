@@ -2,7 +2,7 @@
 //! Uploads .nxpkg files to a repository and updates index.json with checksum info.
 
 use crate::buildins::meta::PackageRecipe;
-use crate::db::download::{fetch_index_verified, PackageEntry, RepoIndex};
+use crate::db::download::{fetch_index_verified, PackageEntry, RepoIndex, ArchAsset};
 use hex;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
@@ -110,13 +110,36 @@ pub async fn upload_and_update_index(
         Err(_) => RepoIndex { packages: std::collections::HashMap::new() },
     };
 
-    // 4) Update entry
-    let entry = PackageEntry {
+    // 4) Update entry with per-architecture asset
+    let arch_canonical = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        "arm" => "arm",
+        "i686" | "x86" => "i686",
+        other => other,
+    }.to_string();
+
+    let mut entry = index.packages.remove(&recipe.package.name).unwrap_or(PackageEntry{
         latest_version: recipe.package.version.clone(),
-        download_url: download_url.clone(),
         description: description.unwrap_or("").to_string(),
-        sha256: Some(checksum),
-    };
+        download_url: None,
+        sha256: None,
+        architectures: Some(std::collections::HashMap::new()),
+    });
+
+    // Ensure architectures map exists
+    if entry.architectures.is_none() { entry.architectures = Some(std::collections::HashMap::new()); }
+    let map = entry.architectures.as_mut().unwrap();
+    map.insert(arch_canonical.clone(), ArchAsset { download_url: download_url.clone(), sha256: Some(checksum) });
+
+    // Update metadata
+    entry.latest_version = recipe.package.version.clone();
+    entry.description = description.unwrap_or("").to_string();
+
+    // For backward compatibility, also set legacy fields to this asset
+    entry.download_url = Some(download_url.clone());
+    entry.sha256 = map.get(&arch_canonical).and_then(|a| a.sha256.clone());
+
     index.packages.insert(recipe.package.name.clone(), entry);
 
     // 5) Upload updated index.json via PUT
