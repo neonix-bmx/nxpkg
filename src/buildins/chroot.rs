@@ -45,7 +45,7 @@ impl ChrootEnv {
         std::fs::create_dir_all(&self.root_path)?;
 
         // 1. Create essential directories
-        let dirs = ["bin", "usr/bin", "lib", "lib64", "proc", "dev", "etc", "build"];
+        let dirs = ["bin", "usr/bin", "lib", "lib64", "proc", "dev", "sys", "etc", "build"];
         for dir in dirs.iter() {
             std::fs::create_dir_all(self.root_path.join(dir))?;
         }
@@ -54,6 +54,17 @@ impl ChrootEnv {
 
 
 
+
+                // Copy host DNS configuration (for networking inside chroot)
+        let host_resolv = Path::new("/etc/resolv.conf");
+        let chroot_resolv = self.root_path.join("etc/resolv.conf");
+        if host_resolv.exists() {
+            if let Err(e) = std::fs::copy(host_resolv, &chroot_resolv) {
+                eprintln!("{} could not copy resolv.conf: {}", "Warning:".yellow(), e);
+            }
+        } else {
+            eprintln!("{} host /etc/resolv.conf not found; DNS may fail inside chroot", "Warning:".yellow());
+        }
 
         // 2. Define binaries needed for building
         let binaries_to_find = [
@@ -142,7 +153,9 @@ impl ChrootEnv {
     /// Runs a command inside the prepared chroot environment using fork, unshare, and chroot.
     /// **Warning:** This function must be run with root privileges.
     pub fn run_command(&self, command: &str, args: &[&str]) -> io::Result<ExitStatus> {
-        let c_command = CString::new(command).unwrap();
+        if nix::unistd::geteuid().as_raw() != 0 {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "run_command requires root privileges (chroot)"));
+        }
         let c_args: Vec<CString> = args.iter().map(|a| CString::new(*a).unwrap()).collect();
 
         match unsafe { fork() } {
@@ -163,7 +176,43 @@ impl ChrootEnv {
                         std::process::exit(101);
                     });
 
-                // 2. Mount /proc for the new PID namespace
+                // 2. Bind-mount /dev and /sys into the chroot root (in this new mount namespace)
+                let dev_src = Path::new("/dev");
+                let dev_dst = self.root_path.join("dev");
+                if let Err(e) = mount(
+                    Some(dev_src),
+                    &dev_dst,
+                    None::<&str>,
+                    MsFlags::MS_BIND | MsFlags::MS_REC,
+                    None::<&str>,
+                ) {
+                    eprintln!("{} bind-mount /dev failed: {}", "Warning:".yellow(), e);
+                }
+
+                let sys_src = Path::new("/sys");
+                let sys_dst = self.root_path.join("sys");
+                if sys_dst.exists() {
+                    if let Err(e) = mount(
+                        Some(sys_src),
+                        &sys_dst,
+                        None::<&str>,
+                        MsFlags::MS_BIND | MsFlags::MS_REC,
+                        None::<&str>,
+                    ) {
+                        eprintln!("{} bind-mount /sys failed: {}", "Warning:".yellow(), e);
+                    } else {
+                        // Remount read-only
+                        let _ = mount(
+                            Some(sys_src),
+                            &sys_dst,
+                            None::<&str>,
+                            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+                            None::<&str>,
+                        );
+                    }
+                }
+
+                // 3. Mount /proc for the new PID namespace
                 let proc_path = self.root_path.join("proc");
                 mount(
                     Some("proc"),
@@ -199,18 +248,35 @@ impl ChrootEnv {
                 if setuid(nobody_uid).is_err() {
                     eprintln!("{}", "Warning: could not setuid to nobody. Continuing as root.".yellow());
                 }
-                
-                // 6. Execute the command
+
+                // 6. Resolve command path inside chroot and execute without relying on PATH
+                let resolved = if command.starts_with('/') {
+                    command.to_string()
+                } else {
+                    let cand_usr = format!("/usr/bin/{}", command);
+                    if std::path::Path::new(&cand_usr).exists() {
+                        cand_usr
+                    } else {
+                        let cand_bin = format!("/bin/{}", command);
+                        if std::path::Path::new(&cand_bin).exists() {
+                            cand_bin
+                        } else {
+                            command.to_string()
+                        }
+                    }
+                };
+
+                let c_command = CString::new(resolved.clone()).unwrap();
                 let mut argv: Vec<&std::ffi::CStr> = Vec::with_capacity(1 + c_args.len());
                 argv.push(c_command.as_c_str());
                 for a in &c_args {
                     argv.push(a.as_c_str());
                 }
-                let exec_result = nix::unistd::execvp(c_command.as_c_str(), &argv);
+                let exec_result = nix::unistd::execv(c_command.as_c_str(), &argv);
                 
-                // execvp only returns if there's an error
+                // execv only returns if there's an error
                 let errno = exec_result.err().unwrap();
-                eprintln!("Fatal: execvp of '{}' failed: {}", command, errno);
+                eprintln!("Fatal: execv of '{}' failed: {}", resolved, errno);
                 std::process::exit(105);
             }
             Err(e) => {
@@ -223,12 +289,14 @@ impl ChrootEnv {
     /// Cleans up the chroot environment. (Requires sudo)
     pub fn cleanup(&self) -> io::Result<()> {
         println!("{}", "Cleaning up chroot environment... (requires sudo)".yellow());
-        
-        // Unmount proc before removing the directory
-        let proc_path = self.root_path.join("proc");
-        if proc_path.exists() {
-             umount(&proc_path)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to unmount /proc: {}", e)))?;
+        // Attempt to unmount common mounts inside chroot path (best-effort)
+        for name in ["proc", "dev", "sys"] {
+            let p = self.root_path.join(name);
+            if p.exists() {
+                if let Err(e) = umount(&p) {
+                    eprintln!("{} could not unmount /{}: {}", "Warning:".yellow(), name, e);
+                }
+            }
         }
 
         std::fs::remove_dir_all(&self.root_path)?;

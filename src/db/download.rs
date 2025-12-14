@@ -13,14 +13,26 @@ use base64::{engine::general_purpose, Engine as _};
 // --- Data Structures for index.json ---
 // These structs mirror the structure of our repository index file.
 
+/// Represents an architecture-specific asset (URL/checksum)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ArchAsset {
+    pub download_url: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
+}
+
 /// Represents a single package entry in the index.
+/// Backward compatible: legacy fields download_url/sha256 may be present when no per-arch map exists.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PackageEntry {
     pub latest_version: String,
-    pub download_url: String,
     pub description: String,
     #[serde(default)]
+    pub download_url: Option<String>,
+    #[serde(default)]
     pub sha256: Option<String>,
+    #[serde(default)]
+    pub architectures: Option<HashMap<String, ArchAsset>>, // key: arch token (e.g., x86_64, aarch64)
 }
 
 /// Represents the entire repository index file (index.json).
@@ -85,6 +97,45 @@ pub async fn fetch_index_verified(
 
     let idx: RepoIndex = serde_json::from_slice(&index_bytes)?;
     Ok(idx)
+}
+
+/// Select the most appropriate asset for the current host architecture.
+/// Returns (url, sha256)
+pub fn resolve_asset_for_current_arch(entry: &PackageEntry) -> Option<(String, Option<String>)> {
+    // If per-arch assets exist, prefer them
+    if let Some(map) = &entry.architectures {
+        // Build alias set for current arch
+        let host = std::env::consts::ARCH;
+        let aliases: Vec<&'static str> = match host {
+            "x86_64" => vec!["x86_64", "amd64", "x64"],
+            "aarch64" => vec!["aarch64", "arm64"],
+            "arm" => vec!["arm", "armv7", "armhf", "armv7l"],
+            "x86" | "i686" => vec!["x86", "i686", "i386"],
+            "powerpc64" => vec!["ppc64", "ppc64le"],
+            other => vec![other],
+        };
+        // Try exact/alias matches (case-insensitive)
+        for alias in aliases {
+            for (k, v) in map.iter() {
+                if k.eq_ignore_ascii_case(alias) {
+                    return Some((v.download_url.clone(), v.sha256.clone()));
+                }
+            }
+        }
+        // Also consider universal tokens
+        for uni in ["any", "noarch"] {
+            for (k, v) in map.iter() {
+                if k.eq_ignore_ascii_case(uni) {
+                    return Some((v.download_url.clone(), v.sha256.clone()));
+                }
+            }
+        }
+    }
+    // Fallback to legacy fields
+    if let Some(url) = entry.download_url.clone() {
+        return Some((url, entry.sha256.clone()));
+    }
+    None
 }
 
 /// Downloads a file from a URL to a destination path, showing a progress bar.
