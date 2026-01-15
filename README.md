@@ -59,6 +59,3 @@ Note: chroot build and package commands require root privileges.
 ## Development
 - `cargo check`
 - `cargo test` (if/when tests are added)
-
-## License
-No license file is present. Add one if you plan to distribute.
