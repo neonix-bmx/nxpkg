@@ -6,14 +6,19 @@ mod config;
 mod trust;
 use crate::db::download;
 use crate::db::upload;
+use crate::buildins::buildpkg;
 use crate::buildins::chroot::ChrootEnv;
+use crate::buildins::meta::{BuildInfo, InstallInfo, PackageInfo, PackageRecipe};
+use crate::buildins::profile::BuildProfile;
 use crate::config::AppConfig;
 use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 
 pub use compress::decompress_tarball;
 pub use db::PackageManagerDB;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::Connection;
 use indicatif::{ProgressBar, ProgressStyle};
 use colored::*;
@@ -61,8 +66,38 @@ enum Commands {
     // Show about of the nxpkg
     About,
     Buildins {
-        /// Package name
+        /// Repository search term or name
         name: String,
+        /// Package name (auto-detected for common cases)
+        #[arg(short = 'p', long = "package")]
+        package: Option<String>,
+        /// Package version (auto-detected if possible)
+        #[arg(long = "version")]
+        version: Option<String>,
+        /// Output directory for the .nxpkg artifact
+        #[arg(long = "output-dir")]
+        output_dir: Option<String>,
+        /// Staging directory inside chroot for install (default: /pkg)
+        #[arg(long = "staging-dir")]
+        staging_dir: Option<String>,
+        /// Override build system (cargo|meson|cmake|scons|make)
+        #[arg(long = "build-system", value_enum)]
+        build_system: Option<BuildSystemKind>,
+        /// Extra args for configure/setup step (repeatable)
+        #[arg(long = "configure-arg")]
+        configure_args: Vec<String>,
+        /// Extra args for build step (repeatable)
+        #[arg(long = "build-arg")]
+        build_args: Vec<String>,
+        /// Extra args for install step (repeatable)
+        #[arg(long = "install-arg")]
+        install_args: Vec<String>,
+        /// Save resolved build profile to DB
+        #[arg(long = "save-profile")]
+        save_profile: bool,
+        /// Ignore any stored build profile for this package
+        #[arg(long = "no-profile")]
+        no_profile: bool,
     },
 
     /// Manage and select source repositories (from repos.cfg)
@@ -142,43 +177,257 @@ enum RepoRemoteAction {
 
 // Helper enum and function for build system detection
 use walkdir::WalkDir;
-use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
-enum BuildSystem {
-    Cargo(PathBuf),
-    Meson(PathBuf),
-    CMake(PathBuf),
-    SCons(PathBuf),
-    Make(PathBuf),
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BuildSystemKind {
+    Cargo,
+    Meson,
+    Cmake,
+    Scons,
+    Make,
+}
+
+impl BuildSystemKind {
+    fn priority(self) -> u8 {
+        match self {
+            BuildSystemKind::Cargo => 0,
+            BuildSystemKind::Meson => 1,
+            BuildSystemKind::Cmake => 2,
+            BuildSystemKind::Scons => 3,
+            BuildSystemKind::Make => 4,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            BuildSystemKind::Cargo => "cargo",
+            BuildSystemKind::Meson => "meson",
+            BuildSystemKind::Cmake => "cmake",
+            BuildSystemKind::Scons => "scons",
+            BuildSystemKind::Make => "make",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BuildSystemMatch {
+    kind: BuildSystemKind,
+    path: PathBuf,
+    depth: usize,
+}
+
+fn parse_build_system(s: &str) -> Option<BuildSystemKind> {
+    match s.trim().to_lowercase().as_str() {
+        "cargo" => Some(BuildSystemKind::Cargo),
+        "meson" => Some(BuildSystemKind::Meson),
+        "cmake" => Some(BuildSystemKind::Cmake),
+        "scons" => Some(BuildSystemKind::Scons),
+        "make" => Some(BuildSystemKind::Make),
+        _ => None,
+    }
 }
 
 /// Recursively finds the best build system in the cloned repository.
-fn find_build_system(root_path: &Path) -> Option<BuildSystem> {
-    let mut candidates: Vec<BuildSystem> = Vec::new();
+fn find_build_systems(root_path: &Path) -> Vec<BuildSystemMatch> {
+    let mut candidates: Vec<BuildSystemMatch> = Vec::new();
 
     for entry in WalkDir::new(root_path).into_iter().filter_map(Result::ok) {
         let path = entry.path();
-        if path.is_file() {
-            match path.file_name().and_then(|s| s.to_str()) {
-                Some("Cargo.toml") => candidates.push(BuildSystem::Cargo(path.parent().unwrap().to_path_buf())),
-                Some("meson.build") => candidates.push(BuildSystem::Meson(path.parent().unwrap().to_path_buf())),
-                Some("CMakeLists.txt") => candidates.push(BuildSystem::CMake(path.parent().unwrap().to_path_buf())),
-                Some("SConstruct") => candidates.push(BuildSystem::SCons(path.parent().unwrap().to_path_buf())),
-                Some("Makefile") => candidates.push(BuildSystem::Make(path.parent().unwrap().to_path_buf())),
-                _ => {}
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(name) => name,
+            None => continue,
+        };
+
+        let kind = match file_name {
+            "Cargo.toml" => Some(BuildSystemKind::Cargo),
+            "meson.build" => Some(BuildSystemKind::Meson),
+            "CMakeLists.txt" => Some(BuildSystemKind::Cmake),
+            "SConstruct" | "SConscript" => Some(BuildSystemKind::Scons),
+            "Makefile" | "makefile" | "GNUmakefile" => Some(BuildSystemKind::Make),
+            _ => None,
+        };
+
+        if let Some(kind) = kind {
+            if let Some(parent) = path.parent() {
+                let depth = parent.strip_prefix(root_path)
+                    .map(|p| p.components().count())
+                    .unwrap_or(usize::MAX);
+                candidates.push(BuildSystemMatch {
+                    kind,
+                    path: parent.to_path_buf(),
+                    depth,
+                });
             }
         }
     }
 
-    // Return the best candidate based on a priority list
-    candidates.into_iter().min_by_key(|c| match c {
-        BuildSystem::Cargo(_) => 0,
-        BuildSystem::Meson(_) => 1,
-        BuildSystem::SCons(_) => 2,
-        BuildSystem::CMake(_) => 3,
-        BuildSystem::Make(_) => 4,
-    })
+    candidates
+}
+
+fn pick_build_system(
+    candidates: &[BuildSystemMatch],
+    preferred: Option<BuildSystemKind>,
+) -> Option<BuildSystemMatch> {
+    if let Some(kind) = preferred {
+        let mut matches: Vec<BuildSystemMatch> = candidates
+            .iter()
+            .filter(|c| c.kind == kind)
+            .cloned()
+            .collect();
+        matches.sort_by_key(|c| c.depth);
+        return matches.into_iter().next();
+    }
+
+    let mut matches = candidates.to_vec();
+    matches.sort_by_key(|c| (c.kind.priority(), c.depth));
+    matches.into_iter().next()
+}
+
+fn arch_alias() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        "arm" => "arm",
+        "x86" | "i686" => "i686",
+        "powerpc64" => "ppc64",
+        "powerpc64le" => "ppc64le",
+        other => other,
+    }
+}
+
+fn auto_package_name(repo_name_only: &str) -> Option<String> {
+    let lower = repo_name_only.to_lowercase();
+    let arch = arch_alias();
+    if lower.contains("mesa") {
+        Some(format!("mesa-{}", arch))
+    } else if lower == "linux" || lower.contains("kernel") {
+        Some(format!("linux-{}", arch))
+    } else {
+        None
+    }
+}
+
+fn prompt_for_package_name() -> io::Result<String> {
+    print!("Enter package name: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "package name cannot be empty"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn run_chroot_command(
+    chroot_env: &ChrootEnv,
+    command: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+) -> io::Result<std::process::ExitStatus> {
+    let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    chroot_env.run_command(command, &args_ref, cwd)
+}
+
+fn resolve_staging_dir(input: Option<String>) -> Result<PathBuf, String> {
+    let dir = input.unwrap_or_else(|| "/pkg".to_string());
+    let path = PathBuf::from(&dir);
+    if !path.is_absolute() {
+        return Err(format!("staging dir must be absolute: {}", dir));
+    }
+    Ok(path)
+}
+
+fn resolve_output_dir(input: Option<String>) -> Result<PathBuf, String> {
+    let path = match input {
+        Some(p) => PathBuf::from(p),
+        None => std::env::current_dir().map_err(|e| format!("failed to get current dir: {}", e))?,
+    };
+    if let Err(e) = std::fs::create_dir_all(&path) {
+        return Err(format!("failed to create output dir {}: {}", path.display(), e));
+    }
+    Ok(path)
+}
+
+fn read_cargo_version(repo_path: &Path) -> Option<String> {
+    let path = repo_path.join("Cargo.toml");
+    if !path.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: toml::Value = toml::from_str(&content).ok()?;
+    value.get("package")
+        .and_then(|p| p.get("version"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn git_describe(repo_path: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("describe")
+        .arg("--tags")
+        .arg("--always")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let s = raw.trim();
+    if s.is_empty() { None } else { Some(s.to_string()) }
+}
+
+fn resolve_package_version(
+    explicit: Option<String>,
+    repo_path: &Path,
+) -> String {
+    if let Some(v) = explicit {
+        return v;
+    }
+    if let Some(v) = read_cargo_version(repo_path) {
+        return v;
+    }
+    if let Some(v) = git_describe(repo_path) {
+        return v;
+    }
+    "0.0.0".to_string()
+}
+
+fn build_recipe(
+    package_name: &str,
+    version: &str,
+    build_kind: BuildSystemKind,
+    profile: &BuildProfile,
+) -> PackageRecipe {
+    let mut build_commands = Vec::new();
+    build_commands.push(format!("build_system={}", build_kind.as_str()));
+    if !profile.configure_args.is_empty() {
+        build_commands.push(format!("configure_args={}", profile.configure_args.join(" ")));
+    }
+    if !profile.build_args.is_empty() {
+        build_commands.push(format!("build_args={}", profile.build_args.join(" ")));
+    }
+
+    PackageRecipe {
+        package: PackageInfo {
+            name: package_name.to_string(),
+            version: version.to_string(),
+            architectures: vec![arch_alias().to_string()],
+        },
+        build: BuildInfo {
+            dependencies: Vec::new(),
+            commands: build_commands,
+        },
+        install: InstallInfo {
+            install_params: profile.install_args.clone(),
+            installed_files: Vec::new(),
+        },
+    }
 }
 
 // REPO_URL artık /etc veya kullanıcı konfigürasyonundan okunuyor (config::AppConfig)
@@ -336,7 +585,19 @@ async fn main() {
                 }
             }
         }
-        Commands::Buildins { name } => {
+        Commands::Buildins {
+            name,
+            package,
+            version,
+            output_dir,
+            staging_dir,
+            build_system,
+            configure_args,
+            build_args,
+            install_args,
+            save_profile,
+            no_profile,
+        } => {
             let selected_repo = match repo::find_and_select_repo(&name) {
                 Ok(repo) => repo,
                 Err(e) => {
@@ -344,22 +605,80 @@ async fn main() {
                     return;
                 }
             };
-            
-            println!("\nProceeding to build '{}'.", selected_repo.name.cyan());
 
             use std::process::Command;
+
+            let repo_name_only = selected_repo.name.split('/').last().unwrap_or(&selected_repo.name);
+            let package_name = match package {
+                Some(name) => name,
+                None => match auto_package_name(repo_name_only) {
+                    Some(auto_name) => auto_name,
+                    None => match prompt_for_package_name() {
+                        Ok(name) => name,
+                        Err(e) => {
+                            eprintln!("{} {}", "Failed to read package name:".red(), e);
+                            return;
+                        }
+                    },
+                },
+            };
+            let staging_dir_in_chroot = match resolve_staging_dir(staging_dir) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("{} {}", "Invalid staging dir:".red(), e);
+                    return;
+                }
+            };
+            let output_dir = match resolve_output_dir(output_dir) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("{} {}", "Invalid output dir:".red(), e);
+                    return;
+                }
+            };
+
+            println!(
+                "\nProceeding to build '{}' as package '{}'.",
+                selected_repo.name.cyan(),
+                package_name.cyan()
+            );
+
+            let mut profile = if no_profile {
+                BuildProfile::new(&package_name)
+            } else {
+                match db1.get_build_profile(&package_name) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => BuildProfile::new(&package_name),
+                    Err(e) => {
+                        eprintln!("{} {}", "Warning: failed to load build profile:".yellow(), e);
+                        BuildProfile::new(&package_name)
+                    }
+                }
+            };
+            profile.name = package_name.clone();
+            if let Some(kind) = build_system {
+                profile.build_system = Some(kind.as_str().to_string());
+            }
+            if !configure_args.is_empty() {
+                profile.configure_args = configure_args;
+            }
+            if !build_args.is_empty() {
+                profile.build_args = build_args;
+            }
+            if !install_args.is_empty() {
+                profile.install_args = install_args;
+            }
 
             let pb_clone = ProgressBar::new_spinner();
             pb_clone.enable_steady_tick(std::time::Duration::from_millis(120));
             pb_clone.set_style(ProgressStyle::with_template("{spinner:.green} {elapsed_precise} {msg}").unwrap());
-            
-            let repo_name_only = selected_repo.name.split('/').last().unwrap_or(&selected_repo.name);
+
             let clone_path = format!("/tmp/{}", repo_name_only);
 
             let _ = std::fs::remove_dir_all(&clone_path);
 
             pb_clone.set_message(format!("Cloning from {}...", selected_repo.clone_url));
-            
+
             let clone_status = pb_clone.suspend(|| {
                 Command::new("git")
                     .arg("clone")
@@ -401,7 +720,7 @@ async fn main() {
             let pb_build = ProgressBar::new_spinner();
             pb_build.enable_steady_tick(std::time::Duration::from_millis(120));
             pb_build.set_style(ProgressStyle::with_template("{spinner:.yellow} {elapsed_precise} {msg}").unwrap());
-            
+
             // --- Chroot Setup ---
             let chroot_path = Path::new("/tmp/nxpkg-chroot");
             let chroot_env = ChrootEnv::new(&chroot_path);
@@ -411,77 +730,237 @@ async fn main() {
                 let _ = chroot_env.cleanup(); // Attempt to clean up even on failure
                 return;
             }
-            
+
             // Move cloned repo into the chroot build directory
             let chroot_build_dir = chroot_path.join("build");
             std::fs::create_dir_all(&chroot_build_dir).unwrap();
+            let staging_host_path = chroot_path.join(
+                staging_dir_in_chroot.strip_prefix("/").unwrap_or(&staging_dir_in_chroot)
+            );
+            let _ = std::fs::remove_dir_all(&staging_host_path);
+            if let Err(e) = std::fs::create_dir_all(&staging_host_path) {
+                pb_build.finish_with_message(format!("Failed to create staging dir: {}", e).red().to_string());
+                let _ = chroot_env.cleanup();
+                return;
+            }
             let new_repo_path = chroot_build_dir.join(repo_name_only);
             if let Err(e) = std::fs::rename(&clone_path, &new_repo_path) {
-                 pb_build.finish_with_message(format!("Failed to move repo into chroot: {}", e).red().to_string());
+                pb_build.finish_with_message(format!("Failed to move repo into chroot: {}", e).red().to_string());
                 let _ = chroot_env.cleanup();
                 return;
             }
 
             pb_build.set_message(format!("Detecting build system for {} inside chroot...", selected_repo.name));
 
-            let mut build_successful = false;
-            
-            // The path inside the chroot is different
-            let build_path_in_chroot = Path::new("/build").join(repo_name_only);
-
-            match find_build_system(&new_repo_path) { // Detect on the real path
-                Some(BuildSystem::Cargo(_)) => {
-                    pb_build.set_message("Building with 'cargo' in chroot...");
-                    let status = chroot_env.run_command(
-                        "/usr/bin/cargo", 
-                        &["build", "--release", "--manifest-path", &build_path_in_chroot.join("Cargo.toml").to_string_lossy()]
-                    );
-                    if let Ok(exit_status) = status { build_successful = exit_status.success(); }
+            let candidates = find_build_systems(&new_repo_path);
+            let preferred_kind = build_system
+                .or_else(|| profile.build_system.as_deref().and_then(parse_build_system));
+            if preferred_kind.is_none() {
+                if let Some(ref bs) = profile.build_system {
+                    eprintln!("{} {}", "Warning: unknown build system in profile:".yellow(), bs);
+                    profile.build_system = None;
                 }
-                Some(BuildSystem::Meson(path)) => {
-                    // Meson needs to be handled differently inside chroot
-                    pb_build.set_message("Building with 'meson/ninja' in chroot...");
-                     let status = chroot_env.run_command("bash", &[
-                        "-c", 
-                        &format!("cd {} && meson setup build && ninja -C build", build_path_in_chroot.display())
-                    ]);
-                    if let Ok(exit_status) = status { build_successful = exit_status.success(); }
-                }
-                 Some(BuildSystem::CMake(path)) => {
-                    pb_build.set_message("Building with 'cmake/make' in chroot...");
-                    let status = chroot_env.run_command("bash", &[
-                        "-c", 
-                        &format!("cd {} && cmake . && make", build_path_in_chroot.display())
-                    ]);
-                    if let Ok(exit_status) = status { build_successful = exit_status.success(); }
-                }
-                Some(BuildSystem::SCons(path)) => {
-                    pb_build.set_message("Building with 'scons' in chroot...");
-                    let status = chroot_env.run_command("bash", &[
-                        "-c", 
-                        &format!("cd {}", build_path_in_chroot.display())
-                    ]);
-                    if let Ok(exit_status) = status { build_successful = exit_status.success(); }
-                }
-                Some(BuildSystem::Make(path)) => {
-                    pb_build.set_message("Building with 'make' in chroot...");
-                     let status = chroot_env.run_command("bash", &[
-                        "-c", 
-                        &format!("cd {} && make", build_path_in_chroot.display())
-                    ]);
-                    if let Ok(exit_status) = status { build_successful = exit_status.success(); }
-                }
-                None => {
-                    pb_build.finish_with_message(format!("Could not detect a known build system in {}.", selected_repo.name).red().to_string());
+            }
+            let mut selected_build = pick_build_system(&candidates, preferred_kind);
+            if selected_build.is_none() {
+                if let Some(kind) = preferred_kind {
+                    selected_build = Some(BuildSystemMatch {
+                        kind,
+                        path: new_repo_path.clone(),
+                        depth: 0,
+                    });
                 }
             }
 
-            if build_successful {
-                pb_build.finish_with_message(format!("Successfully built {}!", selected_repo.name).green().to_string());
-                println!("Package artifacts are available in the chroot environment (temporarily).");
-                // Next step: buildpkg.rs would take over here to package the artifacts.
+            let Some(selected_build) = selected_build else {
+                pb_build.finish_with_message(format!("Could not detect a known build system in {}.", selected_repo.name).red().to_string());
+                let _ = chroot_env.cleanup();
+                return;
+            };
+            let package_version = resolve_package_version(version, &selected_build.path);
+
+            if save_profile {
+                if profile.build_system.is_none() {
+                    profile.build_system = Some(selected_build.kind.as_str().to_string());
+                }
+                if let Err(e) = db1.save_build_profile(&profile) {
+                    eprintln!("{} {}", "Failed to save build profile:".red(), e);
+                } else {
+                    println!("Saved build profile for '{}'.", package_name.cyan());
+                }
+            }
+
+            let build_path_in_chroot = Path::new("/build").join(repo_name_only);
+            let rel = selected_build.path.strip_prefix(&new_repo_path).unwrap_or(Path::new(""));
+            let src_dir_chroot = if rel.as_os_str().is_empty() {
+                build_path_in_chroot.clone()
+            } else {
+                build_path_in_chroot.join(rel)
+            };
+
+            let _ = std::fs::create_dir_all(selected_build.path.join("build"));
+            let build_dir_chroot = src_dir_chroot.join("build");
+
+            let run = |command: &str, args: Vec<String>, cwd: Option<&Path>| -> bool {
+                match run_chroot_command(&chroot_env, command, &args, cwd) {
+                    Ok(exit_status) => exit_status.success(),
+                    Err(e) => {
+                        eprintln!("{} {}: {}", "Command failed".red(), command, e);
+                        false
+                    }
+                }
+            };
+
+            let mut build_successful = false;
+            let mut install_successful = false;
+            match selected_build.kind {
+                BuildSystemKind::Cargo => {
+                    pb_build.set_message("Building with 'cargo' in chroot...");
+                    let mut args = vec!["build".to_string(), "--release".to_string()];
+                    args.extend(profile.build_args.clone());
+                    build_successful = run("cargo", args, Some(&src_dir_chroot));
+                    if build_successful {
+                        pb_build.set_message("Installing with 'cargo' in chroot...");
+                        let mut install = vec![
+                            "install".to_string(),
+                            "--path".to_string(),
+                            src_dir_chroot.to_string_lossy().to_string(),
+                            "--root".to_string(),
+                            staging_dir_in_chroot.to_string_lossy().to_string(),
+                        ];
+                        install.extend(profile.install_args.clone());
+                        install_successful = run("cargo", install, None);
+                    }
+                }
+                BuildSystemKind::Meson => {
+                    pb_build.set_message("Configuring with 'meson' in chroot...");
+                    let mut setup_args = vec![
+                        "setup".to_string(),
+                        build_dir_chroot.to_string_lossy().to_string(),
+                        src_dir_chroot.to_string_lossy().to_string(),
+                        "--prefix=/usr".to_string(),
+                    ];
+                    setup_args.extend(profile.configure_args.clone());
+                    if run("meson", setup_args, None) {
+                        pb_build.set_message("Building with 'meson' in chroot...");
+                        let mut compile_args = vec![
+                            "compile".to_string(),
+                            "-C".to_string(),
+                            build_dir_chroot.to_string_lossy().to_string(),
+                        ];
+                        compile_args.extend(profile.build_args.clone());
+                        build_successful = run("meson", compile_args, None);
+                        if build_successful {
+                            pb_build.set_message("Installing with 'meson' in chroot...");
+                            let mut install_args_vec = vec![
+                                "install".to_string(),
+                                "-C".to_string(),
+                                build_dir_chroot.to_string_lossy().to_string(),
+                                "--destdir".to_string(),
+                                staging_dir_in_chroot.to_string_lossy().to_string(),
+                            ];
+                            install_args_vec.extend(profile.install_args.clone());
+                            install_successful = run("meson", install_args_vec, None);
+                        }
+                    }
+                }
+                BuildSystemKind::Cmake => {
+                    pb_build.set_message("Configuring with 'cmake' in chroot...");
+                    let mut cmake_args = vec![
+                        "-S".to_string(),
+                        src_dir_chroot.to_string_lossy().to_string(),
+                        "-B".to_string(),
+                        build_dir_chroot.to_string_lossy().to_string(),
+                        "-DCMAKE_BUILD_TYPE=Release".to_string(),
+                        "-DCMAKE_INSTALL_PREFIX=/usr".to_string(),
+                    ];
+                    cmake_args.extend(profile.configure_args.clone());
+                    if run("cmake", cmake_args, None) {
+                        pb_build.set_message("Building with 'cmake' in chroot...");
+                        let mut build_args_vec = vec![
+                            "--build".to_string(),
+                            build_dir_chroot.to_string_lossy().to_string(),
+                        ];
+                        if !profile.build_args.is_empty() {
+                            build_args_vec.push("--".to_string());
+                            build_args_vec.extend(profile.build_args.clone());
+                        }
+                        build_successful = run("cmake", build_args_vec, None);
+                        if build_successful {
+                            pb_build.set_message("Installing with 'cmake' in chroot...");
+                            let mut install_args_vec = vec![
+                                format!("DESTDIR={}", staging_dir_in_chroot.to_string_lossy()),
+                                "cmake".to_string(),
+                                "--install".to_string(),
+                                build_dir_chroot.to_string_lossy().to_string(),
+                                "--prefix".to_string(),
+                                "/usr".to_string(),
+                            ];
+                            install_args_vec.extend(profile.install_args.clone());
+                            install_successful = run("env", install_args_vec, None);
+                        }
+                    }
+                }
+                BuildSystemKind::Scons => {
+                    pb_build.set_message("Building with 'scons' in chroot...");
+                    let args = profile.build_args.clone();
+                    build_successful = run("scons", args, Some(&src_dir_chroot));
+                    if build_successful {
+                        pb_build.set_message("Installing with 'scons' in chroot...");
+                        let mut install = vec![
+                            "install".to_string(),
+                            format!("DESTDIR={}", staging_dir_in_chroot.to_string_lossy()),
+                            "PREFIX=/usr".to_string(),
+                        ];
+                        install.extend(profile.install_args.clone());
+                        install_successful = run("scons", install, Some(&src_dir_chroot));
+                    }
+                }
+                BuildSystemKind::Make => {
+                    let configure_script = selected_build.path.join("configure");
+                    if configure_script.exists() {
+                        pb_build.set_message("Running configure script in chroot...");
+                        let mut cfg_args = vec!["--prefix=/usr".to_string()];
+                        cfg_args.extend(profile.configure_args.clone());
+                        if !run("./configure", cfg_args, Some(&src_dir_chroot)) {
+                            build_successful = false;
+                            pb_build.finish_with_message("Configure step failed.".red().to_string());
+                        }
+                    }
+
+                    if !pb_build.is_finished() {
+                        pb_build.set_message("Building with 'make' in chroot...");
+                        let args = profile.build_args.clone();
+                        build_successful = run("make", args, Some(&src_dir_chroot));
+                        if build_successful {
+                            pb_build.set_message("Installing with 'make' in chroot...");
+                            let mut install = vec![
+                                "install".to_string(),
+                                format!("DESTDIR={}", staging_dir_in_chroot.to_string_lossy()),
+                                "PREFIX=/usr".to_string(),
+                            ];
+                            install.extend(profile.install_args.clone());
+                            install_successful = run("make", install, Some(&src_dir_chroot));
+                        }
+                    }
+                }
+            }
+
+            if build_successful && install_successful {
+                pb_build.set_message("Packaging artifacts...");
+                let recipe = build_recipe(&package_name, &package_version, selected_build.kind, &profile);
+                match buildpkg::create_package(&chroot_path, &staging_dir_in_chroot, &output_dir, &recipe) {
+                    Ok(path) => {
+                        pb_build.finish_with_message(format!("Packaged {} -> {}", package_name, path.display()).green().to_string());
+                    }
+                    Err(e) => {
+                        pb_build.finish_with_message(format!("Packaging failed: {}", e).red().to_string());
+                    }
+                }
+            } else if build_successful && !install_successful {
+                pb_build.finish_with_message(format!("Install failed for {}.", package_name).red().to_string());
             } else if !pb_build.is_finished() {
-                pb_build.finish_with_message(format!("Build process for {} failed.", selected_repo.name).red().to_string());
+                pb_build.finish_with_message(format!("Build process for {} failed.", package_name).red().to_string());
             }
 
             // --- Chroot Cleanup ---

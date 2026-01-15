@@ -1,12 +1,17 @@
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use std::fs::{self, File};
-use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
-use tar::{Archive, Builder};
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
+use tar::{Archive, Builder, EntryType};
+use tempfile::{NamedTempFile, TempDir};
 use walkdir::WalkDir;
 use crate::buildins::meta::PackageRecipe; // Import the recipe struct
+
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 /// A generic helper function to extract any .tar.gz file to a specified destination.
 pub fn extract_tar_gz(source_file: &Path, dest_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -19,8 +24,8 @@ pub fn extract_tar_gz(source_file: &Path, dest_dir: &Path) -> Result<(), Box<dyn
     let reader = BufReader::new(file);
     let decompressor = GzDecoder::new(reader);
     let mut archive = Archive::new(decompressor);
-    archive.unpack(dest_dir)?;
-    
+    let _ = unpack_archive_safe(&mut archive, dest_dir)?;
+
     Ok(())
 }
 
@@ -30,26 +35,38 @@ pub fn extract_tar_gz(source_file: &Path, dest_dir: &Path) -> Result<(), Box<dyn
 /// 1. The parsed `PackageRecipe`.
 /// 2. A `Vec<PathBuf>` of the absolute paths of the installed files.
 pub fn extract_nxpkg(nxpkg_path: &Path) -> Result<(PackageRecipe, Vec<PathBuf>), Box<dyn std::error::Error>> {
-    // Stage 1: Extract the .nxpkg container to a temporary location.
-    let stage1_dir = PathBuf::from("/tmp/nxpkg_stage1");
-    if stage1_dir.exists() {
-        fs::remove_dir_all(&stage1_dir)?;
-    }
-    extract_tar_gz(nxpkg_path, &stage1_dir)?;
+    let mut archive = open_nxpkg_archive(nxpkg_path)?;
+    let mut recipe_text: Option<String> = None;
+    let mut data_file: Option<NamedTempFile> = None;
 
-    // Stage 2: Parse the recipe file from the extracted contents.
-    let recipe_path = stage1_dir.join("package.cfg");
-    if !recipe_path.exists() {
-        return Err("Invalid .nxpkg: 'package.cfg' not found.".into());
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if !matches!(entry_type, EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse) {
+            continue;
+        }
+
+        let entry_path = entry.path()?;
+        let rel = sanitize_entry_path(&entry_path)?;
+        if rel == Path::new("package.cfg") {
+            let mut buf = String::new();
+            entry.read_to_string(&mut buf)?;
+            recipe_text = Some(buf);
+        } else if rel == Path::new("data.tar.gz") {
+            let mut tmp = NamedTempFile::new()?;
+            std::io::copy(&mut entry, &mut tmp)?;
+            tmp.flush()?;
+            data_file = Some(tmp);
+        }
     }
-    let recipe = PackageRecipe::from_file(&recipe_path)
+
+    let recipe_text = recipe_text.ok_or("Invalid .nxpkg: 'package.cfg' not found.")?;
+    let recipe = PackageRecipe::from_str(&recipe_text)
         .map_err(|e| format!("Failed to parse package.cfg: {}", e))?;
 
-    // Stage 2.5: Architecture validation BEFORE installing anything.
+    // Architecture validation BEFORE installing anything.
     let supports_current_arch = {
-        // Normalize function to compare arch names
         fn norm(s: &str) -> String { s.trim().to_lowercase().replace('-', "_") }
-        // Accept if recipe declares no architectures (means universal), or explicitly allows "any"/"noarch".
         if recipe.package.architectures.is_empty() {
             true
         } else {
@@ -62,7 +79,6 @@ pub fn extract_nxpkg(nxpkg_path: &Path) -> Result<(PackageRecipe, Vec<PathBuf>),
                 "powerpc64" | "powerpc64le" => vec!["ppc64", "ppc64le"],
                 other => vec![other],
             };
-            // Also treat universal tokens as valid
             aliases.extend(["any", "noarch"].iter().copied());
             let aliases: Vec<String> = aliases.into_iter().map(|s| s.to_string()).collect();
             declared.iter().any(|d| aliases.iter().any(|a| a == d))
@@ -70,8 +86,6 @@ pub fn extract_nxpkg(nxpkg_path: &Path) -> Result<(PackageRecipe, Vec<PathBuf>),
     };
 
     if !supports_current_arch {
-        // Clean up stage1 because we won't proceed
-        let _ = fs::remove_dir_all(&stage1_dir);
         return Err(format!(
             "Package is not built for this architecture (host: {}, package: {:?})",
             std::env::consts::ARCH,
@@ -79,45 +93,14 @@ pub fn extract_nxpkg(nxpkg_path: &Path) -> Result<(PackageRecipe, Vec<PathBuf>),
         ).into());
     }
 
-    // Stage 3: Extract the data.tar.gz to a *second* temporary location (stage2).
-    let data_tarball_path = stage1_dir.join("data.tar.gz");
-    if !data_tarball_path.exists() {
-        return Err("Invalid .nxpkg: 'data.tar.gz' not found.".into());
-    }
-    let stage2_dir = PathBuf::from("/tmp/nxpkg_stage2");
-    if stage2_dir.exists() {
-        fs::remove_dir_all(&stage2_dir)?;
-    }
-    extract_tar_gz(&data_tarball_path, &stage2_dir)?;
+    let data_file = data_file.ok_or("Invalid .nxpkg: 'data.tar.gz' not found.")?;
+    let file = File::open(data_file.path())?;
+    let reader = BufReader::new(file);
+    let decompressor = GzDecoder::new(reader);
+    let mut archive = Archive::new(decompressor);
+    let installed_files = unpack_archive_safe(&mut archive, Path::new("/"))?;
 
-    // Stage 4: Walk the stage2 directory and copy files to their final destination.
-    let mut final_installed_paths = Vec::new();
-    for entry in WalkDir::new(&stage2_dir).into_iter().filter_map(Result::ok) {
-        if entry.file_type().is_file() {
-            let temp_path = entry.path();
-            let relative_path = temp_path.strip_prefix(&stage2_dir)?;
-            
-            // Prevent directory traversal attacks.
-            if relative_path.components().any(|c| c == std::path::Component::ParentDir) {
-                 return Err(format!("Aborting installation: package contains potentially malicious path '..': {}", relative_path.display()).into());
-            }
-
-            let dest_path = PathBuf::from("/").join(relative_path);
-
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            
-            fs::copy(temp_path, &dest_path)?;
-            final_installed_paths.push(dest_path);
-        }
-    }
-    
-    // Stage 5: Clean up temporary directories.
-    fs::remove_dir_all(&stage1_dir)?;
-    fs::remove_dir_all(&stage2_dir)?;
-
-    Ok((recipe, final_installed_paths))
+    Ok((recipe, installed_files))
 }
 
 /// Creates a .nxpkg archive from a staging directory and a recipe file.
@@ -130,20 +113,15 @@ pub fn create_nxpkg(staging_dir: &Path, recipe: &PackageRecipe, output_path: &Pa
     }
 
     // 1) Build data.tar.gz from the staging directory
-    let tmp_dir = std::env::temp_dir().join("nxpkg_pack");
-    if tmp_dir.exists() {
-        fs::remove_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
-    }
-    fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
-
-    let data_tar_gz_path = tmp_dir.join("data.tar.gz");
+    let tmp_dir = TempDir::new().map_err(|e| e.to_string())?;
+    let data_tar_gz_path = tmp_dir.path().join("data.tar.gz");
     {
         let data_file = File::create(&data_tar_gz_path).map_err(|e| e.to_string())?;
         let enc = GzEncoder::new(data_file, Compression::default());
         let mut tar_builder = Builder::new(enc);
 
         // Add directories and files preserving relative paths
-        for entry in WalkDir::new(staging_dir).into_iter().filter_map(Result::ok) {
+        for entry in WalkDir::new(staging_dir).follow_links(false).into_iter().filter_map(Result::ok) {
             let rel = entry.path().strip_prefix(staging_dir).map_err(|e| e.to_string())?;
             if rel.as_os_str().is_empty() {
                 continue;
@@ -152,6 +130,19 @@ pub fn create_nxpkg(staging_dir: &Path, recipe: &PackageRecipe, output_path: &Pa
                 tar_builder.append_dir(rel, entry.path()).map_err(|e| e.to_string())?;
             } else if entry.file_type().is_file() {
                 tar_builder.append_path_with_name(entry.path(), rel).map_err(|e| e.to_string())?;
+            } else if entry.file_type().is_symlink() {
+                let target = fs::read_link(entry.path()).map_err(|e| e.to_string())?;
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                #[cfg(unix)]
+                if let Ok(meta) = fs::symlink_metadata(entry.path()) {
+                    header.set_mode(meta.permissions().mode());
+                }
+                header.set_link_name(&target).map_err(|e| e.to_string())?;
+                header.set_cksum();
+                tar_builder.append_data(&mut header, rel, std::io::empty()).map_err(|e| e.to_string())?;
             }
         }
         // Finalize encoder
@@ -220,54 +211,29 @@ pub fn create_nxpkg(staging_dir: &Path, recipe: &PackageRecipe, output_path: &Pa
     }
 
     // 4) Cleanup temporary artifacts
-    if let Err(e) = fs::remove_dir_all(&tmp_dir) { eprintln!("Warning: could not clean temp dir {}: {}", tmp_dir.display(), e); }
-
     Ok(())
 }
 
 /// Read only the package.cfg (recipe) from a .nxpkg without installing anything.
 /// Supports both plain tar and gzipped outer container.
 pub fn read_recipe_from_nxpkg(nxpkg_path: &Path) -> Result<PackageRecipe, Box<dyn std::error::Error>> {
-    let mut file = File::open(nxpkg_path)?;
-    let mut magic = [0u8; 2];
-    let _ = file.read(&mut magic)?;
-    file.seek(SeekFrom::Start(0))?;
-
-    // Decide reader based on gzip magic
-    let recipe_string = if magic == [0x1f, 0x8b] {
-        let dec = GzDecoder::new(file);
-        let mut archive = Archive::new(dec);
-        let mut recipe_content = String::new();
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            if entry.path()?.as_ref() == Path::new("package.cfg") {
-                entry.read_to_string(&mut recipe_content)?;
-                break;
-            }
+    let mut archive = open_nxpkg_archive(nxpkg_path)?;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_type = entry.header().entry_type();
+        if !matches!(entry_type, EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse) {
+            continue;
         }
-        if recipe_content.is_empty() { return Err("package.cfg not found in .nxpkg".into()); }
-        recipe_content
-    } else {
-        let mut archive = Archive::new(file);
-        let mut recipe_content = String::new();
-        for entry in archive.entries()? {
-            let mut entry = entry?;
-            if entry.path()?.as_ref() == Path::new("package.cfg") {
-                entry.read_to_string(&mut recipe_content)?;
-                break;
-            }
+        let entry_path = entry.path()?;
+        let rel = sanitize_entry_path(&entry_path)?;
+        if rel == Path::new("package.cfg") {
+            let mut recipe_content = String::new();
+            entry.read_to_string(&mut recipe_content)?;
+            return PackageRecipe::from_str(&recipe_content)
+                .map_err(|e| format!("Failed to parse package.cfg: {}", e).into());
         }
-        if recipe_content.is_empty() { return Err("package.cfg not found in .nxpkg".into()); }
-        recipe_content
-    };
-
-    // Parse by writing to a temporary file and reusing the existing parser
-    let tmp_path = std::env::temp_dir().join(format!("nxpkg_pkgcfg_{}.cfg", std::process::id()));
-    fs::write(&tmp_path, recipe_string.as_bytes())?;
-    let parsed = PackageRecipe::from_file(&tmp_path)
-        .map_err(|e| format!("Failed to parse package.cfg: {}", e))?;
-    let _ = fs::remove_file(&tmp_path);
-    Ok(parsed)
+    }
+    Err("package.cfg not found in .nxpkg".into())
 }
 
 // Keep the old function for compatibility with the Debug1 command, but have it use the new helper.
@@ -275,4 +241,171 @@ pub fn decompress_tarball(input_file: &str) -> Result<(), Box<dyn std::error::Er
     let input_path = Path::new("/tmp/").join(format!("{}.tar.gz", input_file));
     let dest_dir = Path::new("/tmp/nxpkg_extract");
     extract_tar_gz(&input_path, dest_dir)
+}
+
+fn open_nxpkg_archive(nxpkg_path: &Path) -> Result<Archive<Box<dyn Read>>, Box<dyn std::error::Error>> {
+    let file = File::open(nxpkg_path)?;
+    let mut reader = BufReader::new(file);
+    let mut magic = [0u8; 2];
+    let _ = reader.read(&mut magic)?;
+    reader.seek(SeekFrom::Start(0))?;
+
+    let boxed: Box<dyn Read> = if magic == [0x1f, 0x8b] {
+        Box::new(GzDecoder::new(reader))
+    } else {
+        Box::new(reader)
+    };
+
+    Ok(Archive::new(boxed))
+}
+
+fn sanitize_entry_path(path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut clean = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::Normal(p) => clean.push(p),
+            Component::CurDir => {}
+            _ => {
+                return Err(format!("Invalid entry path in archive: {}", path.display()).into());
+            }
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        return Err("Invalid empty entry path in archive".into());
+    }
+    Ok(clean)
+}
+
+fn validate_link_target(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(format!("Invalid symlink target: {}", path.display()).into());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn ensure_no_symlink_parents(
+    dest_root: &Path,
+    dest_path: &Path,
+    created_symlinks: &HashSet<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = dest_path.parent().ok_or("Invalid entry path")?;
+    let rel_parent = parent.strip_prefix(dest_root)
+        .map_err(|_| format!("Entry escapes destination root: {}", dest_path.display()))?;
+
+    let mut current = dest_root.to_path_buf();
+    for comp in rel_parent.components() {
+        current.push(comp);
+        if created_symlinks.contains(&current) {
+            return Err(format!("Refusing to traverse symlink created by archive: {}", current.display()).into());
+        }
+        if dest_root != Path::new("/") {
+            if let Ok(meta) = fs::symlink_metadata(&current) {
+                if meta.file_type().is_symlink() {
+                    return Err(format!("Refusing to traverse symlinked parent: {}", current.display()).into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unpack_archive_safe<R: Read>(archive: &mut Archive<R>, dest_root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut installed = Vec::new();
+    let mut created_symlinks: HashSet<PathBuf> = HashSet::new();
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let entry_type = entry.header().entry_type();
+
+        match entry_type {
+            EntryType::XHeader | EntryType::XGlobalHeader | EntryType::GNULongName | EntryType::GNULongLink => {
+                continue;
+            }
+            _ => {}
+        }
+
+        let entry_path = entry.path()?;
+        let rel = sanitize_entry_path(&entry_path)?;
+        let dest_path = dest_root.join(&rel);
+
+        ensure_no_symlink_parents(dest_root, &dest_path, &created_symlinks)?;
+
+        match entry_type {
+            EntryType::Directory => {
+                if let Ok(meta) = fs::symlink_metadata(&dest_path) {
+                    if meta.file_type().is_symlink() {
+                        return Err(format!("Refusing to create directory over symlink: {}", dest_path.display()).into());
+                    }
+                }
+                let existed = dest_path.exists();
+                fs::create_dir_all(&dest_path)?;
+                #[cfg(unix)]
+                if !existed {
+                    if let Ok(mode) = entry.header().mode() {
+                        fs::set_permissions(&dest_path, fs::Permissions::from_mode(mode & 0o777))?;
+                    }
+                }
+            }
+            EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
+                if let Some(parent) = dest_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+
+                if let Ok(meta) = fs::symlink_metadata(&dest_path) {
+                    if meta.file_type().is_dir() {
+                        return Err(format!("Refusing to overwrite directory with file: {}", dest_path.display()).into());
+                    }
+                    let _ = fs::remove_file(&dest_path);
+                }
+
+                let mut out = OpenOptions::new().create(true).truncate(true).write(true).open(&dest_path)?;
+                std::io::copy(&mut entry, &mut out)?;
+                #[cfg(unix)]
+                if let Ok(mode) = entry.header().mode() {
+                    fs::set_permissions(&dest_path, fs::Permissions::from_mode(mode & 0o777))?;
+                }
+                installed.push(dest_path);
+            }
+            EntryType::Symlink => {
+                let link_target = entry.link_name()?
+                    .ok_or("Symlink entry missing link target")?;
+                validate_link_target(&link_target)?;
+
+                if let Some(parent) = dest_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+
+                if let Ok(meta) = fs::symlink_metadata(&dest_path) {
+                    if meta.file_type().is_dir() {
+                        return Err(format!("Refusing to overwrite directory with symlink: {}", dest_path.display()).into());
+                    }
+                    let _ = fs::remove_file(&dest_path);
+                }
+
+                #[cfg(unix)]
+                symlink(&link_target, &dest_path)?;
+                #[cfg(not(unix))]
+                return Err("Symlink entries are not supported on this platform".into());
+
+                created_symlinks.insert(dest_path.clone());
+                installed.push(dest_path);
+            }
+            EntryType::Link => {
+                return Err("Hard link entries are not supported for security reasons".into());
+            }
+            EntryType::Char | EntryType::Block | EntryType::Fifo => {
+                return Err("Special device entries are not supported".into());
+            }
+            _ => {
+                return Err("Unsupported archive entry type".into());
+            }
+        }
+    }
+
+    Ok(installed)
 }

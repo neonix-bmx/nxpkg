@@ -6,11 +6,12 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::io;
 use std::os::unix::process::ExitStatusExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 use colored::*;
-use nix::mount::{mount, umount, MsFlags};
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{chdir, chroot, fork, setgid, setuid, ForkResult, Gid, Uid};
@@ -45,9 +46,15 @@ impl ChrootEnv {
         std::fs::create_dir_all(&self.root_path)?;
 
         // 1. Create essential directories
-        let dirs = ["bin", "usr/bin", "lib", "lib64", "proc", "dev", "sys", "etc", "build"];
+        let dirs = ["bin", "usr/bin", "lib", "lib64", "proc", "dev", "sys", "etc", "build", "tmp"];
         for dir in dirs.iter() {
             std::fs::create_dir_all(self.root_path.join(dir))?;
+        }
+        let tmp_path = self.root_path.join("tmp");
+        if let Ok(meta) = std::fs::metadata(&tmp_path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o1777);
+            let _ = std::fs::set_permissions(&tmp_path, perms);
         }
 
 
@@ -68,7 +75,7 @@ impl ChrootEnv {
 
         // 2. Define binaries needed for building
         let binaries_to_find = [
-            "bash", "sh", "make", "gcc", "g++", "cargo", "meson", 
+            "bash", "sh", "env", "make", "gcc", "g++", "cargo", "meson",
             "ninja", "cmake", "git", "scons", "python", "ld"
         ];
         
@@ -152,7 +159,7 @@ impl ChrootEnv {
 
     /// Runs a command inside the prepared chroot environment using fork, unshare, and chroot.
     /// **Warning:** This function must be run with root privileges.
-    pub fn run_command(&self, command: &str, args: &[&str]) -> io::Result<ExitStatus> {
+    pub fn run_command(&self, command: &str, args: &[&str], cwd: Option<&Path>) -> io::Result<ExitStatus> {
         if nix::unistd::geteuid().as_raw() != 0 {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "run_command requires root privileges (chroot)"));
         }
@@ -170,13 +177,25 @@ impl ChrootEnv {
                 // This code runs in the child. If anything fails, we exit with a non-zero code.
                 
                 // 1. Unshare namespaces
-                unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
+                unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWUTS)
                     .unwrap_or_else(|e| {
                         eprintln!("Fatal: unshare failed: {}", e);
                         std::process::exit(101);
                     });
 
-                // 2. Bind-mount /dev and /sys into the chroot root (in this new mount namespace)
+                // 2. Make mounts private to avoid leaking mounts to the host
+                mount(
+                    None::<&str>,
+                    Path::new("/"),
+                    None::<&str>,
+                    MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                    None::<&str>,
+                ).unwrap_or_else(|e| {
+                    eprintln!("Fatal: mount propagation change failed: {}", e);
+                    std::process::exit(106);
+                });
+
+                // 3. Bind-mount /dev and /sys into the chroot root (in this new mount namespace)
                 let dev_src = Path::new("/dev");
                 let dev_dst = self.root_path.join("dev");
                 if let Err(e) = mount(
@@ -187,6 +206,14 @@ impl ChrootEnv {
                     None::<&str>,
                 ) {
                     eprintln!("{} bind-mount /dev failed: {}", "Warning:".yellow(), e);
+                } else {
+                    let _ = mount(
+                        Some(dev_src),
+                        &dev_dst,
+                        None::<&str>,
+                        MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+                        None::<&str>,
+                    );
                 }
 
                 let sys_src = Path::new("/sys");
@@ -206,13 +233,13 @@ impl ChrootEnv {
                             Some(sys_src),
                             &sys_dst,
                             None::<&str>,
-                            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+                            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
                             None::<&str>,
                         );
                     }
                 }
 
-                // 3. Mount /proc for the new PID namespace
+                // 4. Mount /proc for the new PID namespace
                 let proc_path = self.root_path.join("proc");
                 mount(
                     Some("proc"),
@@ -225,32 +252,46 @@ impl ChrootEnv {
                     std::process::exit(102);
                 });
                 
-                // 3. Chroot into the new root directory
+                // 5. Chroot into the new root directory
                 chroot(&self.root_path)
                     .unwrap_or_else(|e| {
                         eprintln!("Fatal: chroot failed: {}", e);
                         std::process::exit(103);
                     });
                 
-                // 4. Change directory to the new root
+                // 6. Change directory to the new root
                 chdir("/").unwrap_or_else(|e| {
                     eprintln!("Fatal: chdir to / failed: {}", e);
                     std::process::exit(104);
                 });
 
-                // 5. Drop privileges (optional but good practice)
+                // 7. Drop privileges
                 // Using 'nobody' user (often UID/GID 65534) or a fallback
                 let nobody_uid = Uid::from_raw(65534);
                 let nobody_gid = Gid::from_raw(65534);
-                if setgid(nobody_gid).is_err() {
-                    eprintln!("{}", "Warning: could not setgid to nobody. Continuing as root.".yellow());
+                if let Err(e) = setgid(nobody_gid) {
+                    eprintln!("Fatal: setgid failed: {}", e);
+                    std::process::exit(108);
                 }
-                if setuid(nobody_uid).is_err() {
-                    eprintln!("{}", "Warning: could not setuid to nobody. Continuing as root.".yellow());
+                if let Err(e) = setuid(nobody_uid) {
+                    eprintln!("Fatal: setuid failed: {}", e);
+                    std::process::exit(109);
                 }
 
-                // 6. Resolve command path inside chroot and execute without relying on PATH
-                let resolved = if command.starts_with('/') {
+                // 8. Optionally change to the requested working directory
+                if let Some(dir) = cwd {
+                    if !dir.is_absolute() {
+                        eprintln!("Fatal: cwd must be absolute inside chroot");
+                        std::process::exit(110);
+                    }
+                    chdir(dir).unwrap_or_else(|e| {
+                        eprintln!("Fatal: chdir to {} failed: {}", dir.display(), e);
+                        std::process::exit(111);
+                    });
+                }
+
+                // 9. Resolve command path inside chroot and execute without relying on PATH
+                let resolved = if command.starts_with('/') || command.contains('/') {
                     command.to_string()
                 } else {
                     let cand_usr = format!("/usr/bin/{}", command);
@@ -293,7 +334,7 @@ impl ChrootEnv {
         for name in ["proc", "dev", "sys"] {
             let p = self.root_path.join(name);
             if p.exists() {
-                if let Err(e) = umount(&p) {
+                if let Err(e) = umount2(&p, MntFlags::MNT_DETACH) {
                     eprintln!("{} could not unmount /{}: {}", "Warning:".yellow(), name, e);
                 }
             }
@@ -303,4 +344,3 @@ impl ChrootEnv {
         Ok(())
     }
 }
-

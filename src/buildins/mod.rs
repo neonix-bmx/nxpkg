@@ -8,6 +8,7 @@ use std::io::{self, Write};
 pub mod meta;
 pub mod chroot;
 pub mod buildpkg;
+pub mod profile;
 
 
 

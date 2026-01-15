@@ -34,10 +34,7 @@ pub struct PackageRecipe {
 
 // --- Zero-Dependency Parser Implementation ---
 impl PackageRecipe {
-    pub fn from_file(path: &Path) -> Result<Self, String> {
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Could not read recipe file '{}': {}", path.display(), e))?;
-
+    pub fn from_str(content: &str) -> Result<Self, String> {
         let mut recipe = PackageRecipe::default();
         let mut current_section = "";
 
@@ -93,5 +90,11 @@ impl PackageRecipe {
         }
 
         Ok(recipe)
+    }
+
+    pub fn from_file(path: &Path) -> Result<Self, String> {
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Could not read recipe file '{}': {}", path.display(), e))?;
+        Self::from_str(&content)
     }
 }

@@ -1,5 +1,6 @@
 use crate::buildins::meta::{BuildInfo, InstallInfo, PackageInfo, PackageRecipe};
-use rusqlite::{Connection, Result};
+use crate::buildins::profile::BuildProfile;
+use rusqlite::{params, Connection, Result};
 pub mod download;
 pub mod upload;
 
@@ -24,6 +25,16 @@ impl PackageManagerDB {
                 build_commands TEXT,
                 install_params TEXT,
                 installed_files TEXT
+            )",
+            [],
+        )?;
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS build_profiles (
+                name TEXT PRIMARY KEY,
+                build_system TEXT,
+                configure_args TEXT,
+                build_args TEXT,
+                install_args TEXT
             )",
             [],
         )?;
@@ -127,5 +138,57 @@ impl PackageManagerDB {
         // Finally, remove the package entry from the database.
         self.db.execute("DELETE FROM packages WHERE name = ?", [name])?;
         Ok(())
+    }
+
+    pub fn save_build_profile(&self, profile: &BuildProfile) -> Result<()> {
+        let configure_json = serde_json::to_string(&profile.configure_args).unwrap_or_else(|_| "[]".to_string());
+        let build_json = serde_json::to_string(&profile.build_args).unwrap_or_else(|_| "[]".to_string());
+        let install_json = serde_json::to_string(&profile.install_args).unwrap_or_else(|_| "[]".to_string());
+
+        self.db.execute(
+            "INSERT OR REPLACE INTO build_profiles (name, build_system, configure_args, build_args, install_args)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                &profile.name,
+                profile.build_system.as_deref(),
+                configure_json,
+                build_json,
+                install_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_build_profile(&self, name: &str) -> Result<Option<BuildProfile>> {
+        let mut stmt = self.db.prepare(
+            "SELECT build_system, configure_args, build_args, install_args
+             FROM build_profiles WHERE name = ?1",
+        )?;
+
+        let result = stmt.query_row([name], |row| {
+            let build_system: Option<String> = row.get(0)?;
+            let configure_args_raw: String = row.get(1)?;
+            let build_args_raw: String = row.get(2)?;
+            let install_args_raw: String = row.get(3)?;
+
+            let build_system = build_system.filter(|s| !s.trim().is_empty());
+            let configure_args: Vec<String> = serde_json::from_str(&configure_args_raw).unwrap_or_default();
+            let build_args: Vec<String> = serde_json::from_str(&build_args_raw).unwrap_or_default();
+            let install_args: Vec<String> = serde_json::from_str(&install_args_raw).unwrap_or_default();
+
+            Ok(BuildProfile {
+                name: name.to_string(),
+                build_system,
+                configure_args,
+                build_args,
+                install_args,
+            })
+        });
+
+        match result {
+            Ok(profile) => Ok(Some(profile)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
